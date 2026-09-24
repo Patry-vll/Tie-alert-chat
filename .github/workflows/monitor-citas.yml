@@ -1,0 +1,47 @@
+name: Monitor de citas TIE
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor-citas-tie
+  cancel-in-progress: false
+
+jobs:
+  buscar-citas:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+
+      - name: Configurar .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restaurar estado de citas ya notificadas
+        uses: actions/cache/restore@v4
+        with:
+          path: appointment-state.json
+          key: citas-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            citas-
+
+      - name: Buscar citas y avisar por Telegram
+        run: dotnet run --project src/TieAlertBot.csproj --configuration Release
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          RUN_ONCE: "true"
+          STATE_FILE: appointment-state.json
+
+      - name: Guardar estado de citas notificadas
+        uses: actions/cache/save@v4
+        with:
+          path: appointment-state.json
+          key: citas-${{ github.run_id }}-${{ github.run_attempt }}
