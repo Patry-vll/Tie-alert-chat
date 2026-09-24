@@ -1,9 +1,23 @@
 name: Monitor de citas TIE
 
+# GitHub interpreta el cron en UTC. Madrid es UTC+2 en verano y UTC+1 en invierno,
+# por eso hay disparos para ambos horarios. El bot comprueba la hora de Madrid y
+# termina en seguida si no queda ninguna franja en los próximos 60 minutos.
+# Cada bloque tiene un disparo de respaldo 15 minutos después por si GitHub
+# retrasa u omite el primero (concurrency evita ejecuciones simultáneas).
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    # Franja 06:00-07:00 (arranca a las 05:35 y 05:50 hora de Madrid)
+    - cron: "35 3 * * *"   # verano
+    - cron: "50 3 * * *"   # verano (respaldo)
+    - cron: "35 4 * * *"   # invierno
+    - cron: "50 4 * * *"   # invierno (respaldo)
+    # Franjas 08:45-09:15 y 09:45-10:15 (arranca a las 08:20 y 08:35 hora de Madrid)
+    - cron: "20 6 * * *"   # verano
+    - cron: "35 6 * * *"   # verano (respaldo)
+    - cron: "20 7 * * *"   # invierno
+    - cron: "35 7 * * *"   # invierno (respaldo)
 
 permissions:
   contents: read
@@ -15,6 +29,11 @@ concurrency:
 jobs:
   buscar-citas:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
     steps:
       - name: Obtener código
         uses: actions/checkout@v4
@@ -23,6 +42,9 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "10.0.x"
+
+      - name: Compilar
+        run: dotnet build src/TieAlertBot.csproj --configuration Release
 
       - name: Restaurar estado de citas ya notificadas
         uses: actions/cache/restore@v4
@@ -33,14 +55,18 @@ jobs:
             citas-
 
       - name: Buscar citas y avisar por Telegram
-        run: dotnet run --project src/TieAlertBot.csproj --configuration Release
+        run: dotnet run --project src/TieAlertBot.csproj --configuration Release --no-build
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          RUN_ONCE: "true"
+          SCHEDULE_WINDOWS: "06:00-07:00,08:45-09:15,09:45-10:15"
+          TIME_ZONE: Europe/Madrid
+          INTERVAL_SECONDS: "30"
+          MAX_LEAD_MINUTES: "60"
           STATE_FILE: appointment-state.json
 
       - name: Guardar estado de citas notificadas
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: appointment-state.json

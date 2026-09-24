@@ -25,6 +25,7 @@ if (string.IsNullOrWhiteSpace(botToken) || string.IsNullOrWhiteSpace(chatId))
 
 var intervalSeconds = int.TryParse(Environment.GetEnvironmentVariable("INTERVAL_SECONDS"), out var seconds)
     ? Math.Clamp(seconds, 30, 3600) : 300;
+var interval = TimeSpan.FromSeconds(intervalSeconds);
 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 http.DefaultRequestHeaders.UserAgent.ParseAdd("TieAlertBot/1.0");
 var stateFile = Environment.GetEnvironmentVariable("STATE_FILE") ?? "appointment-state.json";
@@ -33,9 +34,55 @@ var known = File.Exists(stateFile)
     : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 await File.WriteAllLinesAsync(stateFile, known);
 var runOnce = string.Equals(Environment.GetEnvironmentVariable("RUN_ONCE"), "true", StringComparison.OrdinalIgnoreCase);
-Console.WriteLine(runOnce ? "Ejecución puntual iniciada." : $"Monitor iniciado; intervalo {intervalSeconds}s. Ctrl+C para salir.");
+var windows = ParseWindows(Environment.GetEnvironmentVariable("SCHEDULE_WINDOWS"));
+var timeZone = TimeZoneInfo.FindSystemTimeZoneById(Environment.GetEnvironmentVariable("TIME_ZONE") ?? "Europe/Madrid");
+var maxLead = TimeSpan.FromMinutes(int.TryParse(Environment.GetEnvironmentVariable("MAX_LEAD_MINUTES"), out var lead)
+    ? Math.Clamp(lead, 0, 180) : 60);
 
+if (runOnce)
+{
+    Console.WriteLine("Ejecución puntual iniciada.");
+    return await CheckAsync() ? 0 : 2;
+}
+
+if (windows.Count > 0)
+{
+    // Modo franjas: busca solo dentro de las franjas horarias y termina cuando no queda ninguna próxima.
+    Console.WriteLine($"Monitor por franjas ({timeZone.Id}): {string.Join(", ", windows)}; intervalo {intervalSeconds}s.");
+    while (true)
+    {
+        var now = LocalTimeOfDay();
+        var current = windows.FirstOrDefault(w => now >= w.Start && now < w.End);
+        if (current is null)
+        {
+            var next = windows.FirstOrDefault(w => w.Start > now);
+            if (next is null || next.Start - now > maxLead)
+            {
+                Console.WriteLine($"{now:hh\\:mm}: no hay franjas próximas; fin de la ejecución.");
+                return 0;
+            }
+            Console.WriteLine($"{now:hh\\:mm}: esperando a la franja {next}.");
+            await Task.Delay(next.Start - now);
+            continue;
+        }
+
+        await CheckAsync();
+        var remaining = current.End - LocalTimeOfDay();
+        if (remaining > TimeSpan.Zero)
+            await Task.Delay(remaining < interval ? remaining : interval);
+    }
+}
+
+Console.WriteLine($"Monitor iniciado; intervalo {intervalSeconds}s. Ctrl+C para salir.");
 while (true)
+{
+    await CheckAsync();
+    await Task.Delay(interval);
+}
+
+TimeSpan LocalTimeOfDay() => TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, timeZone).TimeOfDay;
+
+async Task<bool> CheckAsync()
 {
     try
     {
@@ -58,18 +105,32 @@ while (true)
                 known.Add($"{appointment.Office}|{appointment.Date}|{appointment.Time}");
             await File.WriteAllLinesAsync(stateFile, known.OrderBy(key => key, StringComparer.OrdinalIgnoreCase));
         }
+        return true;
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"{DateTimeOffset.Now}: {ex.Message}");
-        if (runOnce) return 2;
+        return false;
     }
-
-    if (runOnce) break;
-    await Task.Delay(TimeSpan.FromSeconds(intervalSeconds));
 }
 
-return 0;
+// Formato: "06:00-07:00,08:45-09:15,09:45-10:15" (hora local de TIME_ZONE).
+static List<TimeWindow> ParseWindows(string? value)
+{
+    var result = new List<TimeWindow>();
+    if (string.IsNullOrWhiteSpace(value)) return result;
+    foreach (var part in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+    {
+        var bounds = part.Split('-', StringSplitOptions.TrimEntries);
+        if (bounds.Length != 2
+            || !TimeSpan.TryParseExact(bounds[0], "hh\\:mm", CultureInfo.InvariantCulture, out var start)
+            || !TimeSpan.TryParseExact(bounds[1], "hh\\:mm", CultureInfo.InvariantCulture, out var end)
+            || end <= start)
+            throw new FormatException($"Franja no válida en SCHEDULE_WINDOWS: '{part}'. Usa HH:mm-HH:mm.");
+        result.Add(new TimeWindow(start, end));
+    }
+    return result.OrderBy(w => w.Start).ToList();
+}
 
 static List<Appointment> ParseAppointments(string html, string[] offices)
 {
@@ -97,11 +158,9 @@ static string Normalize(string value)
 }
 
 record Appointment(string Office, string Date, string Time);
+record TimeWindow(TimeSpan Start, TimeSpan End)
+{
+    public override string ToString() => $"{Start:hh\\:mm}-{End:hh\\:mm}";
+}
 record TelegramMessage([property: JsonPropertyName("chat_id")] string ChatId,
                        [property: JsonPropertyName("text")] string Text);
-
-
-
-
-
-
